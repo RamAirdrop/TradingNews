@@ -14,7 +14,6 @@ import portfolio as pf
 import storage
 
 st.set_page_config(page_title="Daybreak | NSE paper trading", page_icon="🌅", layout="wide")
-OFF_HOURS = os.environ.get("ALLOW_OFF_HOURS") == "1"
 
 
 # ------------------------------------------------------------------ helpers
@@ -23,6 +22,9 @@ def secret(name: str, default=None):
         return st.secrets.get(name, default)
     except Exception:  # noqa: BLE001 - no secrets file configured
         return default
+
+
+OFF_HOURS = str(secret("ALLOW_OFF_HOURS", os.environ.get("ALLOW_OFF_HOURS", "1"))).strip() == "1"
 
 
 def inr(value) -> str:
@@ -72,7 +74,7 @@ def ensure_snapshot(force: bool = False) -> dict:
     return state
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def intraday(symbol: str):
     return market.fetch_intraday(f"{symbol}.NS")
 
@@ -104,7 +106,12 @@ def settle_user(key: str) -> dict:
 
 
 def open_trade(key: str, stock: dict, amount: float) -> str:
-    quote = market.fetch_quote(f"{stock['symbol']}.NS")
+    try:
+        quote = market.fetch_quote(f"{stock['symbol']}.NS")
+    except Exception:  # noqa: BLE001
+        quote = stock.get("quote")
+        if not quote:
+            raise
     scenario = market.build_scenario(quote, stock["score"])
     if not scenario:
         raise ValueError("No directional scenario is available for this stock.")
@@ -124,7 +131,10 @@ def close_trade(key: str, position_id: int) -> str:
         position = next((x for x in p["positions"] if x["id"] == position_id), None)
         if not position:
             raise ValueError("Position not found.")
-        price = market.fetch_quote(f"{position['symbol']}.NS")["price"]
+        try:
+            price = market.fetch_quote(f"{position['symbol']}.NS")["price"]
+        except Exception:  # noqa: BLE001
+            price = position["lastPrice"]
         trade = pf.close_position(p, position_id, price, "Closed manually")
         storage.kv_set(f"portfolio:{key}", p)
     return f"Closed {trade['symbol']}: {signed(trade['pnl'])}"

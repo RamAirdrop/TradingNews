@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import html
+import json
 import math
 import re
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import quote as urlquote, urlparse
 
 import requests
@@ -16,6 +19,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SESSION_OPEN = 9 * 60 + 15
 SQUARE_OFF = 15 * 60 + 15
 MORNING_REFRESH = 9 * 60 + 30
+
+CACHE_DIR = Path("/tmp/daybreak_quote_cache")
 
 SOURCES = [
     {"name": "Economic Times", "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"},
@@ -213,18 +218,82 @@ def parse_feed(xml_text: str, source: dict, now: datetime | None = None) -> list
     return articles
 
 
-HEADERS = {"User-Agent": "DaybreakResearch/1.0 (personal market research)"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
 
 
-def _get(url: str, as_json: bool = False):
-    response = requests.get(url, headers=HEADERS, timeout=14)
-    response.raise_for_status()
-    return response.json() if as_json else response.text
+def _cache_path(key: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    return CACHE_DIR / f"{safe}.json"
+
+
+def _read_cache(key: str, max_age_sec: float):
+    path = _cache_path(key)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - payload.get("ts", 0) <= max_age_sec:
+            return payload.get("data")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _write_cache(key: str, data) -> None:
+    try:
+        _cache_path(key).write_text(
+            json.dumps({"ts": time.time(), "data": data}),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _get(url: str, as_json: bool = False, cache_key: str | None = None, ttl: float = 120.0):
+    if cache_key:
+        cached = _read_cache(cache_key, ttl)
+        if cached is not None:
+            return cached
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=14)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else (1.5 * (2 ** attempt))
+                time.sleep(min(wait, 8.0))
+                last_err = requests.HTTPError(f"429 Client Error: Too Many Requests for url: {url}", response=response)
+                continue
+            response.raise_for_status()
+            data = response.json() if as_json else response.text
+            if cache_key:
+                _write_cache(cache_key, data)
+            return data
+        except requests.RequestException as exc:
+            last_err = exc
+            time.sleep(0.8 * (2 ** attempt))
+
+    if cache_key:
+        stale = _read_cache(cache_key, max_age_sec=86400 * 3)
+        if stale is not None:
+            return stale
+    raise last_err
 
 
 # ---------------------------------------------------------------------- quotes
 def _chart(symbol: str, rng: str, interval: str) -> dict:
-    data = _get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urlquote(symbol, safe='')}?range={rng}&interval={interval}", True)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urlquote(symbol, safe='')}?range={rng}&interval={interval}"
+    ttl = 300.0 if interval == "1d" else 90.0
+    data = _get(url, as_json=True, cache_key=f"chart_{symbol}_{rng}_{interval}", ttl=ttl)
     chart = data.get("chart") or {}
     result = (chart.get("result") or [None])[0]
     if not result or chart.get("error"):
@@ -344,13 +413,14 @@ def collect_market(now: datetime | None = None) -> dict:
     candidates.sort(key=lambda s: (-abs(s["score"]), -len(s["news"])))
 
     def price(stock: dict) -> None:
+        time.sleep(0.35)
         try:
             stock["quote"] = fetch_quote(f"{stock['symbol']}.NS", now)
         except Exception as error:  # noqa: BLE001
             stock["quoteError"] = str(error)
             errors.append(f"{stock['symbol']}: {error}")
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(price, candidates))
     index = None
     try:
